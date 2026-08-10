@@ -1,7 +1,23 @@
+import os
+
+from dotenv import load_dotenv
+
 from app.core.logger import logger
+
+load_dotenv()
 
 TRANSLATE_API_TYPE_OPTIONS = ("dashscope", "custom")
 TRANSLATE_MODE_OPTIONS = ("parallel", "structured")
+
+
+def _is_true_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DEFAULT_USE_GPU = _is_true_env("MOEGAL_USE_GPU", default=False)
 
 
 class CustomConf:
@@ -11,9 +27,12 @@ class CustomConf:
             translate_api_type="custom",
             # parallel: 每句并发请求；structured: 单请求列表输入输出。
             translate_mode="parallel",
+            # 可由前端在运行时切换；环境变量只决定服务启动时的默认值。
+            use_gpu=DEFAULT_USE_GPU,
             ):
         self.translate_api_type = translate_api_type
         self.translate_mode = translate_mode
+        self.use_gpu = use_gpu
 
     def update_conf(self, attr, v):
         if not hasattr(self, attr):
@@ -26,6 +45,8 @@ class CustomConf:
             raise ValueError(
                 f"translate_mode 必须是 {TRANSLATE_MODE_OPTIONS}"
             )
+        if attr == "use_gpu" and type(v) is not bool:
+            raise ValueError("use_gpu 必须是布尔值")
         setattr(self, attr, v)
         logger.info(f"将 {attr} 设置为 {v}")
         return {

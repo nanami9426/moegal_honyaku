@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
@@ -8,11 +7,11 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-from dotenv import load_dotenv
 from manga_ocr import MangaOcr
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
+from app.core.custom_conf import custom_conf
 from app.core.logger import logger
 from app.core.paths import MODELS_DIR
 
@@ -20,11 +19,12 @@ TEXT_BUBBLE_MODEL_PATH = MODELS_DIR / "comic-text-and-bubble-detector"
 TEXT_BUBBLE_LABEL = "text_bubble"
 TEXT_BUBBLE_CONFIDENCE = 0.8
 MOCR_MODEL_PATH = MODELS_DIR / "manga-ocr-base"
-load_dotenv()
 
 _MODEL_LOCK = Lock()
 _DET_MODEL: TextBubbleDetector | None = None
 _MOCR: MangaOcr | None = None
+_MOCR_DEVICE: str | None = None
+_GPU_FALLBACK_REASON = ""
 
 
 @dataclass(frozen=True)
@@ -33,13 +33,6 @@ class TextBubbleDetector:
     model: torch.nn.Module
     device: torch.device
     label_id: int
-
-
-def _is_true_env(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _is_cuda_related_error(exc: Exception) -> bool:
@@ -70,9 +63,12 @@ def _is_cuda_runtime_usable() -> tuple[bool, str]:
 
 
 def _resolve_device() -> tuple[torch.device, bool]:
-    gpu_enabled = _is_true_env("MOEGAL_USE_GPU", default=False)
+    global _GPU_FALLBACK_REASON
+
+    gpu_enabled = custom_conf.use_gpu
     cuda_usable, cuda_fail_reason = _is_cuda_runtime_usable() if gpu_enabled else (False, "")
     use_cuda = gpu_enabled and cuda_usable
+    _GPU_FALLBACK_REASON = cuda_fail_reason if gpu_enabled and not use_cuda else ""
 
     if gpu_enabled and not use_cuda:
         logger.warning(f"检测到 GPU 已启用但 CUDA 不可用，自动回退 CPU。原因：{cuda_fail_reason}")
@@ -94,7 +90,7 @@ def _resolve_label_id(model: torch.nn.Module) -> int:
 
 
 def warmup_models() -> tuple[TextBubbleDetector, MangaOcr]:
-    global _DET_MODEL, _MOCR
+    global _DET_MODEL, _GPU_FALLBACK_REASON, _MOCR, _MOCR_DEVICE
 
     with _MODEL_LOCK:
         if _DET_MODEL is not None and _MOCR is not None:
@@ -111,7 +107,17 @@ def warmup_models() -> tuple[TextBubbleDetector, MangaOcr]:
             model = AutoModelForObjectDetection.from_pretrained(
                 str(TEXT_BUBBLE_MODEL_PATH),
                 local_files_only=True,
-            ).to(device)
+            )
+            try:
+                model = model.to(device)
+            except Exception as exc:
+                if not use_cuda or not _is_cuda_related_error(exc):
+                    raise
+                logger.warning(f"文字气泡检测模型 CUDA 初始化失败，自动回退 CPU。原因：{exc}")
+                _GPU_FALLBACK_REASON = str(exc)
+                device = torch.device("cpu")
+                use_cuda = False
+                model = model.to(device)
             model.eval()
             _DET_MODEL = TextBubbleDetector(
                 processor=processor,
@@ -125,18 +131,75 @@ def warmup_models() -> tuple[TextBubbleDetector, MangaOcr]:
             if use_cuda:
                 try:
                     _MOCR = MangaOcr(pretrained_model_name_or_path=str(MOCR_MODEL_PATH), force_cpu=False)
+                    _MOCR_DEVICE = "cuda"
                     logger.info("MangaOCR 加载成功，使用：cuda")
                 except Exception as exc:
                     if not _is_cuda_related_error(exc):
                         raise
                     logger.warning(f"MangaOCR CUDA 初始化失败，自动回退 CPU。原因：{exc}")
+                    _GPU_FALLBACK_REASON = str(exc)
                     _MOCR = MangaOcr(pretrained_model_name_or_path=str(MOCR_MODEL_PATH), force_cpu=True)
+                    _MOCR_DEVICE = "cpu"
                     logger.info("MangaOCR 加载成功，使用：cpu")
             else:
                 _MOCR = MangaOcr(pretrained_model_name_or_path=str(MOCR_MODEL_PATH), force_cpu=True)
+                _MOCR_DEVICE = "cpu"
                 logger.info("MangaOCR 加载成功，使用：cpu")
 
         return _DET_MODEL, _MOCR
+
+
+def reset_models() -> None:
+    """释放模型单例，使下一次 OCR 请求按最新设备配置重新加载。"""
+    global _DET_MODEL, _GPU_FALLBACK_REASON, _MOCR, _MOCR_DEVICE
+
+    with _MODEL_LOCK:
+        _DET_MODEL = None
+        _MOCR = None
+        _MOCR_DEVICE = None
+        _GPU_FALLBACK_REASON = ""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("OCR 模型设备配置已更新，将在下一次请求时重新加载")
+
+
+def get_gpu_status() -> dict[str, Any]:
+    requested = bool(custom_conf.use_gpu)
+    with _MODEL_LOCK:
+        detector_device = str(_DET_MODEL.device) if _DET_MODEL is not None else None
+        mocr_device = _MOCR_DEVICE
+        loaded = _DET_MODEL is not None and _MOCR is not None
+        fallback_reason = _GPU_FALLBACK_REASON
+
+    if loaded:
+        detector_uses_gpu = bool(detector_device and detector_device.startswith("cuda"))
+        mocr_uses_gpu = mocr_device == "cuda"
+        uses_gpu = detector_uses_gpu or mocr_uses_gpu
+        fully_on_gpu = detector_uses_gpu and mocr_uses_gpu
+        available = uses_gpu if requested else None
+        if requested and not fully_on_gpu:
+            message = "GPU 未能用于全部 OCR 模型，已自动回退到 CPU"
+        else:
+            message = ""
+    elif requested:
+        available, fallback_reason = _is_cuda_runtime_usable()
+        uses_gpu = available
+        message = "" if available else f"GPU 不可用，将自动使用 CPU：{fallback_reason}"
+    else:
+        available = None
+        uses_gpu = False
+        message = ""
+
+    return {
+        "requested": requested,
+        "available": available,
+        "device": "gpu" if uses_gpu else "cpu",
+        "models_loaded": loaded,
+        "detector_device": detector_device,
+        "mocr_device": mocr_device,
+        "fallback_reason": fallback_reason if requested and not uses_gpu else "",
+        "message": message,
+    }
 
 
 def get_det_model() -> TextBubbleDetector:

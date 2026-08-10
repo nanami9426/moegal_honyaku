@@ -47,7 +47,7 @@ DASHSCOPE_MODEL=qwen3-max
 - 默认配置为 `custom + parallel`。
 - 运行时可通过配置接口切换供应商与翻译模式（见下文）。
 - 若当前供应商未配置 Key，服务不会启动失败，但在 popup 配置页和实际翻译时会提示需要填写对应 `.env`。
-- 为了保证首次启动稳定，OCR 默认使用 CPU。若需启用 GPU，可在 `.env` 添加 `MOEGAL_USE_GPU=1`（若驱动/显卡不兼容会自动回退 CPU）。
+- 为了保证首次启动稳定，OCR 默认使用 CPU。`MOEGAL_USE_GPU=1` 可指定服务启动时默认选择 GPU，也可直接在浏览器插件 popup 中随时切换 CPU/GPU；下一次翻译会按新设备重新加载 OCR 模型。若驱动或显卡不兼容，会自动回退 CPU 并在 popup 中提示。
 
 ### 4. 启动服务
 
@@ -165,14 +165,27 @@ curl -X POST "http://127.0.0.1:8000/conf/update" \
 curl -X POST "http://127.0.0.1:8000/conf/update" \
   -H "Content-Type: application/json" \
   -d '{"attr":"translate_mode","v":"structured"}'
+
+# 更新配置示例：启用 GPU（传 false 可切回 CPU）
+curl -X POST "http://127.0.0.1:8000/conf/update" \
+  -H "Content-Type: application/json" \
+  -d '{"attr":"use_gpu","v":true}'
 ```
 
-`/conf/query`、`/conf/init`、`/conf/update` 的返回中会额外带上 `provider_status`，用于提示当前供应商是否已配置。例如：
+`/conf/query`、`/conf/init`、`/conf/update` 的返回中会额外带上 `provider_status` 和 `gpu_status`，用于提示当前供应商是否已配置，以及请求的计算设备是否实际可用。例如：
 
 ```json
 {
   "translate_api_type": "custom",
   "translate_mode": "parallel",
+  "use_gpu": true,
+  "gpu_status": {
+    "requested": true,
+    "available": false,
+    "device": "cpu",
+    "models_loaded": false,
+    "message": "GPU 不可用，将自动使用 CPU：torch.cuda.is_available() = False"
+  },
   "provider_status": {
     "custom": {
       "configured": false,
